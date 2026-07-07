@@ -1,30 +1,17 @@
-"""
-instrument_ui.py  --  Interactive UI for the RealSound custom-instrument generator.
-
-This is *scaffolding* around the physics engine you built in guitar.ipynb.
-Nothing here invents new DSP: every sound is produced by your own functions
-(pluck_string -> orthotropic_plate -> real_plate_strike -> fftconvolve).
-The UI just turns the function arguments into sliders, plays the result, and
-lets you download the WAV.
-
-Run it with:
-    pip install gradio        # one-time
-    python instrument_ui.py
-then open the http://127.0.0.1:7860 link it prints.
-
-See RealSound_Instrument_UI_Explainer.md for the physics behind each control
-and the design decisions (including the indexing bug this file fixes).
-"""
 
 import functools
+import os
+import tempfile
+import zipfile
 import numpy as np
 import scipy.linalg
 import scipy.signal
+from scipy.io import wavfile
 import matplotlib
 matplotlib.use("Agg")            # headless: we render figures to images, never a window
 import matplotlib.pyplot as plt
 
-fs = 44100                       # sample rate (Hz) -- CD standard, as in the notebook
+fs = 44100                       # sample rate (Hz) 
 
 
 # ----------------------------------------------------------------------------
@@ -51,7 +38,6 @@ def note_to_N(freq_hz, fs=fs):
 
 
 def pluck_string(beta=0.5, N=100, duration=2.0, fs=fs, rho=1.0):
-    """Your notebook function, unchanged."""
     p = int(beta * N)
     p = min(max(p, 1), N - 1)                 # keep the pluck strictly inside the string
     increasing = np.linspace(0, 1, p)
@@ -192,7 +178,7 @@ def guitar_voice(f, body_IR, rho=0.99, beta=0.5, fs=fs):
 
 
 def play_sequence(freqs, voice, dt=0.4, fs=fs):
-    """Your onset-mixing sequencer.
+    """
 
     Note k starts at time k*dt and is SUMMED into the buffer, so the ringing
     tail of each note overlaps the attack of the next. dt < a note's sustain =>
@@ -206,7 +192,7 @@ def play_sequence(freqs, voice, dt=0.4, fs=fs):
     for o, n in zip(onsets, notes):
         out[o:o + len(n)] += n
     peak = np.max(np.abs(out))
-    return (out / peak) if peak else out       # (fixed: original paste dropped a paren)
+    return (out / peak) if peak else out     
 
 
 def make_scale(root_hz, semitones):
@@ -214,8 +200,45 @@ def make_scale(root_hz, semitones):
     return root_hz * 2 ** (np.array(semitones) / 12)
 
 
+def export_pack(lo, hi, beta, rho, ax, ay, resolution, f0, Q,
+                sx, sy, lx, ly, n_modes, fs=fs):
+    """Render every chromatic note between lo and hi with the CURRENT settings,
+    write each to its own WAV, and zip them into a sample pack.
+
+    The body IR is built once (the instrument is fixed); only the string pitch
+    changes per note -- the same build-once structure as guitar_voice. Each note
+    is peak-normalised to 0.98 so it's a clean one-shot sample.
+    """
+    body_IR = build_body_ir(ax, ay, int(resolution), f0, Q,
+                            (sx, sy), (lx, ly), int(n_modes))
+    voice = lambda f: guitar_voice(f, body_IR, rho=rho, beta=beta, fs=fs)
+
+    i0, i1 = ALL_NOTES.index(lo), ALL_NOTES.index(hi)
+    if i0 > i1:
+        i0, i1 = i1, i0
+
+    tag = f"ax{ax:.1f}_ay{ay:.1f}_Q{int(Q)}_b{beta:.2f}_rho{rho:.3f}"
+    outdir = tempfile.mkdtemp(prefix="realsound_pack_")
+    zip_path = os.path.join(outdir, f"realsound_{tag}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in ALL_NOTES[i0:i1 + 1]:
+            y = voice(note_name_to_hz(name))
+            peak = np.max(np.abs(y))
+            if peak:
+                y = 0.98 * y / peak
+            wav = np.int16(np.clip(y, -1, 1) * 32767)     # 16-bit PCM one-shot
+            wav_path = os.path.join(outdir, f"{name}_{tag}.wav")
+            wavfile.write(wav_path, fs, wav)
+            z.write(wav_path, arcname=os.path.basename(wav_path))
+    return zip_path
+
+
 # Equal temperament: f_k = f_root * 2^(k/12).  Used by the scale player.
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Full chromatic range used by the sample-pack exporter (C1..B6).
+# Defined here, after NOTE_NAMES, because it is built from it.
+ALL_NOTES = [f"{n}{o}" for o in range(1, 7) for n in NOTE_NAMES]
 
 # Chords are just interval stacks played together. Feeding these to
 # play_sequence with dt=0 stacks them at t=0 (a block chord); a small dt
@@ -340,9 +363,23 @@ def build_ui():
                 audio = gr.Audio(label="Sound (download from the player)", type="numpy")
                 plot = gr.Plot(label="Waveform + spectrum")
 
+                gr.Markdown("### Export sample pack")
+                with gr.Row():
+                    lo_note = gr.Dropdown(ALL_NOTES, value="E2", label="Lowest note")
+                    hi_note = gr.Dropdown(ALL_NOTES, value="E5", label="Highest note")
+                export_btn = gr.Button("Download all notes (.zip)")
+                pack_file = gr.File(label="Sample pack — one WAV per note, current settings")
+
         inputs = [note, beta, rho, ax, ay, resolution, f0, Q,
                   sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type, mode]
         go.click(render, inputs=inputs, outputs=[audio, plot])
+
+        export_btn.click(
+            export_pack,
+            inputs=[lo_note, hi_note, beta, rho, ax, ay, resolution, f0, Q,
+                    sx, sy, lx, ly, n_modes],
+            outputs=pack_file,
+        )
     return demo
 
 
