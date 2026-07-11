@@ -345,7 +345,7 @@ def build_ui():
                                        label="Grid resolution (higher = more modes, slower)")
                 f0 = gr.Slider(80, 400, 220, step=5, label="Body base frequency f₀ (Hz)")
                 Q = gr.Slider(3, 80, 20, step=1, label="Body Q (resonance sharpness / ring)")
-                f0 = gr.Slider(0, 2200, 220, step = 1, label = "220Hz for guitar.")
+                f0 = gr.Slider(0, 2200, 220, step = 1, label = "Fundamental Frequency (Hz)")
             with gr.Column():
                 gr.Markdown("### Strike & listen points (fractions of the plate)")
                 sx = gr.Slider(0, 1, 0.5, step=0.02, label="Strike x")
