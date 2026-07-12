@@ -1,6 +1,7 @@
 
 import functools
 import os
+import re
 import tempfile
 import zipfile
 import numpy as np
@@ -11,7 +12,13 @@ import matplotlib
 matplotlib.use("Agg")            # headless: we render figures to images, never a window
 import matplotlib.pyplot as plt
 
-fs = 44100                       # sample rate (Hz) 
+fs = 44100                       # sample rate (Hz)
+
+
+def safe_name(name, fallback="realsound"):
+    """Sanitise a user-typed filename into a safe basename (no path escapes)."""
+    cleaned = re.sub(r"[^\w.-]", "_", (name or "").strip())
+    return cleaned or fallback
 
 
 # ----------------------------------------------------------------------------
@@ -92,41 +99,99 @@ def sustain_duration(rho=0.99, N=100, fs=fs):
 # resolution), so we cache them: striking or listening somewhere else does not
 # change the modes, only how much each one is excited/heard.
 
-@functools.lru_cache(maxsize=16)
-def orthotropic_plate(ax=4.0, ay=1.0, resolution=30):
-    """Build the plate operator and diagonalise it. Cached by its arguments.
+# --- Body outline (mask) generators -----------------------------------------
+# A real top is not a square. We restrict the plate to a boolean mask of the
+# body outline; the finite-difference operator is then built ONLY on the
+# interior cells, with every neighbour that falls outside the mask treated as
+# pinned (w = 0). Different masks = different bodies. (eight_mask/circle_mask
+# are verbatim from the notebook; X is grid axis 0, Y is axis 1, indexing='ij'.)
 
-    Returns (evals, evecs, resolution). ax=ay reproduces the isotropic plate."""
-    res = int(resolution)
-    Nn = res * res
-
-    def idx(i, j):
-        return i * res + j
-
-    L = np.zeros((Nn, Nn))
-    for i in range(res):
-        for j in range(res):
-            p = idx(i, j)
-            L[p, p] = -(2 * ax + 2 * ay)                 # anisotropic Laplacian stencil
-            if i > 0:        L[p, idx(i - 1, j)] = ax
-            if i < res - 1:  L[p, idx(i + 1, j)] = ax
-            if j > 0:        L[p, idx(i, j - 1)] = ay
-            if j < res - 1:  L[p, idx(i, j + 1)] = ay
-    K = L @ L                                            # plate = Laplacian squared
-    evals, evecs = scipy.linalg.eigh(K)                 # modes: K phi = lambda phi
-    return evals, evecs, res
+def eight_mask(res=40, cxTop=0.5, cyTop=0.68, rTop=0.18, cxBot=0.5, cyBot=0.35,
+               rBot=0.25, xHole=0.5, yHole=0.52, rHole=0.05):
+    """Rounded figure-8 guitar top: a small upper bout ∪ a bigger lower bout,
+    with the soundhole disc cut OUT of the plate mesh."""
+    x = np.linspace(0, 1, res)
+    y = np.linspace(0, 1, res)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    topBody = (X - cxTop) ** 2 + (Y - cyTop) ** 2 <= rTop ** 2
+    botBody = (X - cxBot) ** 2 + (Y - cyBot) ** 2 <= rBot ** 2
+    soundhole = (X - xHole) ** 2 + (Y - yHole) ** 2 <= rHole ** 2
+    body = topBody | botBody
+    body = body & ~soundhole
+    return body
 
 
-def plate_ir(evals, evecs, res, f0=220.0, Q=20.0,
+def circle_mask(res=40, cx=0.5, cy=0.5, r=0.4):
+    """A circular drum-head body, for comparison."""
+    x = np.linspace(0, 1, res)
+    y = np.linspace(0, 1, res)
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    return (X - cx) ** 2 + (Y - cy) ** 2 <= r ** 2
+
+
+def plate_from_mask(mask, ax=4.0, ay=1.0):
+    """Biharmonic plate on an arbitrary outline via an index map.
+
+    `interior` lists the cells inside the mask; `idx` maps a grid cell (i,j) to
+    its matrix row (or -1 outside). We assemble the anisotropic Laplacian L only
+    over interior cells, connecting to a neighbour only when that neighbour is
+    also inside the mask (otherwise the edge is dropped -> pinned boundary).
+    Then K = L@L and we diagonalise. Returns (evals, evecs, idx) where idx is
+    the 2-D index-map ARRAY (indexed with [], not called)."""
+    interior = np.argwhere(mask)                 # matrix row -> grid cell
+    idx = -np.ones(mask.shape, dtype=int)        # grid cell -> matrix row (-1 outside)
+    for row, (i, j) in enumerate(interior):
+        idx[i, j] = row
+    M = len(interior)
+    L = np.zeros((M, M))
+    for row, (i, j) in enumerate(interior):
+        L[row, row] = -(2 * ax + 2 * ay)         # diagonal of the anisotropic stencil
+        for (di, dj, w) in [(-1, 0, ax), (1, 0, ax), (0, -1, ay), (0, 1, ay)]:
+            ni, nj = i + di, j + dj
+            if 0 <= ni < mask.shape[0] and 0 <= nj < mask.shape[1] and mask[ni, nj]:
+                L[row, idx[ni, nj]] = w           # connect only to interior neighbours
+    K = L @ L
+    evals, evecs = scipy.linalg.eigh(K)
+    return evals, evecs, idx
+
+
+MASKS = {
+    "Guitar (figure-8)": eight_mask,
+    "Circle": circle_mask,
+    "Rectangle": lambda res: np.ones((res, res), dtype=bool),   # full grid = old square
+}
+
+
+@functools.lru_cache(maxsize=32)
+def plate_modes(ax=4.0, ay=1.0, resolution=30, shape="Guitar (figure-8)"):
+    """Cached body modes for a shape. Returns (evals, evecs, idx_map).
+    Cached by (ax, ay, resolution, shape) — the modes depend only on these."""
+    mask = MASKS.get(shape, eight_mask)(int(resolution))
+    return plate_from_mask(mask, ax, ay)
+
+
+def _frac_to_row(pt, idx_map):
+    """Map a fractional plate coordinate (0..1, 0..1) to a matrix row.
+    If the requested cell is outside the mask (or in the soundhole), snap to the
+    nearest interior cell so strike/listen always land on the body."""
+    res = idx_map.shape[0]
+    i = min(max(int(round(pt[0] * (res - 1))), 0), res - 1)
+    j = min(max(int(round(pt[1] * (res - 1))), 0), res - 1)
+    if idx_map[i, j] >= 0:
+        return int(idx_map[i, j])
+    ii, jj = np.where(idx_map >= 0)              # nearest interior cell
+    k = int(np.argmin((ii - i) ** 2 + (jj - j) ** 2))
+    return int(idx_map[ii[k], jj[k]])
+
+
+def plate_ir(evals, evecs, idx_map, f0=220.0, Q=20.0,
              strike=(0.5, 0.5), listen=(0.5, 0.5),
              n_modes=10, duration=0.6, fs=fs):
     """Body impulse response = sum of decaying modal sinusoids.
 
-    IMPORTANT FIX vs. the notebook: the original real_plate_strike used a
-    *global* idx() built for a 20x20 grid, so at resolution=40 the strike and
-    listen points landed on the wrong nodes. Here idx is rebuilt from the
-    actual resolution, and strike/listen are given as fractions 0..1 of the
-    plate so they mean the same physical spot at any resolution.
+    Strike/listen are fractions 0..1 of the plate, mapped to interior matrix
+    rows via the shape's index map (so a point always lands on the body, even
+    for a masked outline).
 
     - amp = phi_k(strike) * phi_k(listen): reciprocity. A mode is loud only if
       the strike moves it AND the listening point can see it. Strike or listen
@@ -134,18 +199,8 @@ def plate_ir(evals, evecs, res, f0=220.0, Q=20.0,
     - freqs scaled so the lowest mode sits at f0 (the body's lowest resonance).
     - tau = Q / (pi * f) : a resonance of quality Q. Higher modes ring shorter.
     """
-    res = int(res)
-
-    def idx(i, j):
-        return i * res + j
-
-    def frac_to_node(pt):
-        i = min(max(int(round(pt[0] * (res - 1))), 0), res - 1)
-        j = min(max(int(round(pt[1] * (res - 1))), 0), res - 1)
-        return idx(i, j)
-
-    s_node = frac_to_node(strike)
-    l_node = frac_to_node(listen)
+    s_node = _frac_to_row(strike, idx_map)
+    l_node = _frac_to_row(listen, idx_map)
 
     t = np.arange(int(fs * duration)) / fs
     freqs = f0 * np.sqrt(evals) / np.sqrt(evals[0])
@@ -203,7 +258,7 @@ def modal_bank(freqs, amps, Qs, t):
     return y
 
 
-def build_body_ir_soundhole(evals, evecs, res, Q=20, strike=(0.5, 0.5),
+def build_body_ir_soundhole(evals, evecs, idx_map, Q=20, strike=(0.5, 0.5),
                             listen=(0.5, 0.5), n_modes=30, f_top=180.0, g_low=1.0,
                             duration=0.6, fs=fs, **osc):
     """Body IR = the three coupled low modes + the higher plate modes, mixed.
@@ -212,17 +267,8 @@ def build_body_ir_soundhole(evals, evecs, res, Q=20, strike=(0.5, 0.5),
     handled properly by the coupled top/back/air model. `g_low` sets how loud the
     coupled low body sits under the plate modes. `**osc` forwards soundhole
     parameters (f_back, Volume, hole_radius, ...) to three_oscillator_model."""
-    res = int(res)
-
-    def idx(i, j):
-        return i * res + j
-
-    def frac_to_node(pt):
-        i = min(max(int(round(pt[0] * (res - 1))), 0), res - 1)
-        j = min(max(int(round(pt[1] * (res - 1))), 0), res - 1)
-        return idx(i, j)
-
-    s_node, l_node = frac_to_node(strike), frac_to_node(listen)
+    s_node = _frac_to_row(strike, idx_map)
+    l_node = _frac_to_row(listen, idx_map)
     t = np.arange(int(fs * duration)) / fs
 
     # higher plate modes (skip mode 0 = fundamental, now from the coupled model)
@@ -262,16 +308,17 @@ def build_body_ir_soundhole(evals, evecs, res, Q=20, strike=(0.5, 0.5),
 
 def build_body_ir(ax, ay, resolution, f0, Q, strike, listen, n_modes,
                   model="Plate only", f_back=200.0, volume=0.012,
-                  hole_radius=0.041, g_low=1.0, fs=fs):
-    """Dispatch to the chosen body model. `f0` doubles as the top-plate
-    resonance f_top in the soundhole model (both scale the plate mode set)."""
-    evals, evecs, res = orthotropic_plate(ax, ay, resolution)   # cached
+                  hole_radius=0.041, g_low=1.0, shape="Guitar (figure-8)", fs=fs):
+    """Dispatch to the chosen body model on the chosen body shape. `f0` doubles
+    as the top-plate resonance f_top in the soundhole model (both scale the
+    plate mode set)."""
+    evals, evecs, idx_map = plate_modes(ax, ay, int(resolution), shape)   # cached
     if model == "Plate + soundhole":
         return build_body_ir_soundhole(
-            evals, evecs, res, Q=Q, strike=strike, listen=listen,
+            evals, evecs, idx_map, Q=Q, strike=strike, listen=listen,
             n_modes=n_modes, f_top=f0, g_low=g_low,
             f_back=f_back, Volume=volume, hole_radius=hole_radius, fs=fs)
-    return plate_ir(evals, evecs, res, f0=f0, Q=Q,
+    return plate_ir(evals, evecs, idx_map, f0=f0, Q=Q,
                     strike=strike, listen=listen, n_modes=n_modes, fs=fs)
 
 
@@ -312,27 +359,29 @@ def make_scale(root_hz, semitones):
 def export_pack(lo, hi, beta, rho, ax, ay, resolution, f0, Q,
                 sx, sy, lx, ly, n_modes,
                 model="Plate only", f_back=200.0, volume=0.012,
-                hole_radius=0.041, g_low=1.0, fs=fs):
+                hole_radius=0.041, g_low=0.1, shape="Guitar (figure-8)",
+                fname="realsound", fs=fs):
     """Render every chromatic note between lo and hi with the CURRENT settings,
     write each to its own WAV, and zip them into a sample pack.
 
     The body IR is built once (the instrument is fixed); only the string pitch
     changes per note -- the same build-once structure as guitar_voice. Each note
-    is peak-normalised to 0.98 so it's a clean one-shot sample.
+    is peak-normalised to 0.98 so it's a clean one-shot sample. `fname` is the
+    user-chosen base name: the zip is <fname>.zip and each note <fname>_<note>.wav.
     """
     body_IR = build_body_ir(ax, ay, int(resolution), f0, Q,
                             (sx, sy), (lx, ly), int(n_modes),
                             model=model, f_back=f_back, volume=volume,
-                            hole_radius=hole_radius, g_low=g_low)
+                            hole_radius=hole_radius, g_low=g_low, shape=shape)
     voice = lambda f: guitar_voice(f, body_IR, rho=rho, beta=beta, fs=fs)
 
     i0, i1 = ALL_NOTES.index(lo), ALL_NOTES.index(hi)
     if i0 > i1:
         i0, i1 = i1, i0
 
-    tag = f"ax{ax:.1f}_ay{ay:.1f}_Q{int(Q)}_b{beta:.2f}_rho{rho:.3f}"
+    base = safe_name(fname)                                # download name is the file's name
     outdir = tempfile.mkdtemp(prefix="realsound_pack_")
-    zip_path = os.path.join(outdir, f"realsound_{tag}.zip")
+    zip_path = os.path.join(outdir, f"{base}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         for name in ALL_NOTES[i0:i1 + 1]:
             y = voice(note_name_to_hz(name))
@@ -340,7 +389,7 @@ def export_pack(lo, hi, beta, rho, ax, ay, resolution, f0, Q,
             if peak:
                 y = 0.98 * y / peak
             wav = np.int16(np.clip(y, -1, 1) * 32767)     # 16-bit PCM one-shot
-            wav_path = os.path.join(outdir, f"{name}_{tag}.wav")
+            wav_path = os.path.join(outdir, f"{base}_{name}.wav")
             wavfile.write(wav_path, fs, wav)
             z.write(wav_path, arcname=os.path.basename(wav_path))
     return zip_path
@@ -410,14 +459,14 @@ def build_ui():
 
     def render(note, beta, rho, ax, ay, resolution, f0, Q,
                sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type,
-               body_model, f_back, volume, hole_radius, g_low, mode):
+               body_model, f_back, volume, hole_radius, g_low, shape, fname, mode):
         strike = (sx, sy)
         listen = (lx, ly)
         # Build the body IR once, then reuse it for every note via a voice closure.
         body_IR = build_body_ir(ax, ay, int(resolution), f0, Q,
                                  strike, listen, int(n_modes),
                                  model=body_model, f_back=f_back, volume=volume,
-                                 hole_radius=hole_radius, g_low=g_low)
+                                 hole_radius=hole_radius, g_low=g_low, shape=shape)
         voice = lambda f: guitar_voice(f, body_IR, rho=rho, beta=beta)
         root = note_name_to_hz(note)
 
@@ -438,7 +487,11 @@ def build_ui():
             title = f"{note} scale ({int(scale_steps)} notes, dt={dt:.2f}s)"
         y = y.astype(np.float32)
         fig = plot_wave_spectrum(y, title)
-        return (fs, y), fig
+        # Write a WAV named as the user asked -> that name is what the browser
+        # downloads (the audio player's own button can't be renamed).
+        wav_path = os.path.join(tempfile.mkdtemp(), f"{safe_name(fname)}.wav")
+        wavfile.write(wav_path, fs, np.int16(np.clip(y, -1, 1) * 32767))
+        return (fs, y), fig, wav_path
 
     notes = [f"{n}{o}" for o in range(2, 6) for n in NOTE_NAMES]
     with gr.Blocks(title="RealSound Instrument") as demo:
@@ -459,6 +512,8 @@ def build_ui():
                 ay = gr.Slider(0.5, 8.0, 1.0, step=0.1, label="Stiffness across grain a_y")
                 resolution = gr.Slider(16, 40, 30, step=2,
                                        label="Grid resolution (higher = more modes, slower)")
+                shape = gr.Dropdown(list(MASKS.keys()), value="Guitar (figure-8)",
+                                    label="Body shape (outline mask)")
                 f0 = gr.Slider(80, 400, 220, step=5,
                                label="Body base freq f₀ / top-plate f_top (Hz)")
                 Q = gr.Slider(3, 80, 20, step=1, label="Body Q (resonance sharpness / ring)")
@@ -472,8 +527,8 @@ def build_ui():
                                    label="Cavity volume V (m³) — lower = higher air pitch")
                 hole_radius = gr.Slider(0.02, 0.06, 0.041, step=0.001,
                                         label="Soundhole radius (m) — sets Helmholtz air pitch")
-                g_low = gr.Slider(0.0, 2.0, 1.0, step=0.05,
-                                  label="Low-body gain g_low — weight of coupled low modes")
+                g_low = gr.Slider(0.0, 2.0, 0.1, step=0.05,
+                                  label="Low-body gain g_low — keep low so the shape isn't buried")
             with gr.Column():
                 gr.Markdown("### Strike & listen points (fractions of the plate)")
                 sx = gr.Slider(0, 1, 0.5, step=0.02, label="Strike x")
@@ -488,8 +543,11 @@ def build_ui():
                 scale_steps = gr.Slider(2, 8, 8, step=1, label="Scale length (notes)")
                 dt = gr.Slider(0.0, 1.5, 0.4, step=0.02,
                                label="Note spacing dt (s) — 0 = block chord, small = strum")
+                fname = gr.Textbox(value="realsound",
+                                   label="File name (no extension) — used for downloads")
                 go = gr.Button("Generate", variant="primary")
-                audio = gr.Audio(label="Sound (download from the player)", type="numpy")
+                audio = gr.Audio(label="Sound (listen)", type="numpy")
+                download = gr.DownloadButton("Download WAV (named)")
                 plot = gr.Plot(label="Waveform + spectrum")
 
                 gr.Markdown("### Export sample pack")
@@ -497,18 +555,18 @@ def build_ui():
                     lo_note = gr.Dropdown(ALL_NOTES, value="E2", label="Lowest note")
                     hi_note = gr.Dropdown(ALL_NOTES, value="E5", label="Highest note")
                 export_btn = gr.Button("Download all notes (.zip)")
-                pack_file = gr.File(label="Sample pack — one WAV per note, current settings")
+                pack_file = gr.File(label="Sample pack — <name>_<note>.wav in <name>.zip")
 
         inputs = [note, beta, rho, ax, ay, resolution, f0, Q,
                   sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type,
-                  body_model, f_back, volume, hole_radius, g_low, mode]
-        go.click(render, inputs=inputs, outputs=[audio, plot])
+                  body_model, f_back, volume, hole_radius, g_low, shape, fname, mode]
+        go.click(render, inputs=inputs, outputs=[audio, plot, download])
 
         export_btn.click(
             export_pack,
             inputs=[lo_note, hi_note, beta, rho, ax, ay, resolution, f0, Q,
                     sx, sy, lx, ly, n_modes,
-                    body_model, f_back, volume, hole_radius, g_low],
+                    body_model, f_back, volume, hole_radius, g_low, shape, fname],
             outputs=pack_file,
         )
     return demo
