@@ -26,33 +26,47 @@ fs = 44100                       # sample rate (Hz)
 # the note decays -- that is the string's damping.
 
 def note_to_N(freq_hz, fs=fs):
-    """Invert f ~= fs/(N+0.5) to get the delay-line length for a pitch.
+    """Integer delay length for a pitch, only used to size the render buffer.
 
-    Physical note: N must be an integer number of samples, so the achievable
-    pitches are quantised. The error grows at high frequency (small N), where
-    one sample is a large fraction of the period. Below we accept that error;
-    a fractional-delay allpass would fix it, and is a natural later milestone.
-    """
-    N = int(round(fs / freq_hz - 0.5))
-    return max(2, N)
+    The *audible* pitch is now set exactly by the fractional delay in
+    pluck_string; this integer N is just a convenient handle for the T60/length
+    calculation in sustain_duration."""
+    return max(2, int(round(fs / freq_hz - 0.5)))
 
 
-def pluck_string(beta=0.5, N=100, duration=2.0, fs=fs, rho=1.0):
-    p = int(beta * N)
-    p = min(max(p, 1), N - 1)                 # keep the pluck strictly inside the string
-    increasing = np.linspace(0, 1, p)
-    decreasing = np.linspace(1, 0, N - p)
-    buf = np.concatenate((increasing, decreasing))   # triangular pluck shape
+def pluck_string(beta=0.5, f=220.0, duration=2.0, fs=fs, rho=1.0):
+    """Fractional-delay Karplus-Strong: pitch is set EXACTLY, not quantised.
 
+    Physics: pitch needs a loop delay of D = fs/f - 0.5 samples, but a plain
+    ring buffer can only delay by a whole number of samples, so the old
+    round(D) shaved the tuning (worse up high, where one sample is a big slice
+    of the period). Here we split D into an integer part N = floor(D) and a
+    fraction frac, and read the delay line by LINEARLY INTERPOLATING between the
+    tap at N and the tap at N+1:  y = (1-frac)*d[N] + frac*d[N+1]. That
+    fractional read places the loop delay exactly at D, so every note is in
+    tune. The 0.5*(y+last)*rho feedback is the same 2-point averaging low-pass
+    and loss as before."""
+    D = fs / f - 0.5
+    N = int(D)
+    frac = D - N
+
+    p = min(max(int(beta * N), 1), N - 1)
+    pluck = np.concatenate((np.linspace(0, 1, p), np.linspace(1, 0, N - p)))
+
+    L = N + 2                                 # buffer a bit longer than the max tap
+    buf = np.zeros(L)
+    buf[:N] = pluck
     out = np.zeros(int(fs * duration))
-    idx = 0
+    w = 0                                     # write index
     last = 0.0
     for i in range(len(out)):
-        out[i] = buf[idx]
-        x = buf[idx]
-        buf[idx] = 0.5 * (x + last) * rho     # 2-point average + loss -> low-pass decay
-        last = x
-        idx = (idx + 1) % N
+        r0 = (w - N) % L                      # tap at delay N
+        r1 = (w - N - 1) % L                  # tap one sample older (N+1)
+        y = (1 - frac) * buf[r0] + frac * buf[r1]   # fractional (interpolated) read
+        buf[w] = 0.5 * (y + last) * rho       # 2-point average + loss
+        last = y
+        out[i] = y
+        w = (w + 1) % L
     return out
 
 
@@ -148,6 +162,92 @@ def plate_ir(evals, evecs, res, f0=220.0, Q=20.0,
 
 
 # ----------------------------------------------------------------------------
+# 2b. THE SOUNDHOLE  (top plate + back plate + Helmholtz air, coupled)
+# ----------------------------------------------------------------------------
+# A real guitar box has three low-frequency degrees of freedom that talk to each
+# other through the enclosed air: the top plate flexing, the back plate flexing,
+# and the air breathing in/out of the soundhole (a Helmholtz resonator, ~90-110
+# Hz). The shared cavity air is a spring linking all three. Coupled oscillators
+# repel, so the three bare frequencies split into three new normal modes -- this
+# is what gives a guitar its warm low end and its characteristic "boom".
+
+def three_oscillator_model(f_top=180, f_back=200, m_top=0.15, m_back=0.05,
+                           Volume=0.012, hole_radius=0.041, hole_thickness=0.003,
+                           top_area=0.18, back_area=0.013, rho=1.2, c=343):
+    """Solve the 3x3 generalised eigenproblem K phi = w^2 M phi for the coupled
+    top/back/air modes. M is the mass matrix; K is the bare stiffnesses plus the
+    air-spring term (rho c^2 / V) a a^T, where a = [A_top, A_back, -A_hole] is
+    the piston-area vector (air leaves through the hole, hence the minus)."""
+    omega_top = 2 * np.pi * f_top
+    omega_back = 2 * np.pi * f_back
+    hole_area = np.pi * hole_radius ** 2
+    L_eff = hole_thickness + 1.2 * hole_radius        # end corrections, both faces
+    m_hole = rho * hole_area * L_eff                  # air-plug mass
+
+    a = np.array([top_area, back_area, -hole_area])
+    M = np.diag([m_top, m_back, m_hole])
+    K = np.diag([m_top * omega_top ** 2, m_back * omega_back ** 2, 0.0]) \
+        + (rho * c ** 2 / Volume) * np.outer(a, a)    # shared air spring couples them
+
+    evals, evecs = scipy.linalg.eigh(K, M)
+    freqs = np.sqrt(np.clip(evals, 0, None)) / (2 * np.pi)
+    return freqs, evecs
+
+
+def modal_bank(freqs, amps, Qs, t):
+    """Sum a set of decaying sinusoids -- one resonance per (freq, amp, Q)."""
+    y = np.zeros_like(t)
+    for f, a, Q in zip(freqs, amps, Qs):
+        tau = Q / (np.pi * f)
+        y += a * np.sin(2 * np.pi * f * t) * np.exp(-t / tau)
+    return y
+
+
+def build_body_ir_soundhole(evals, evecs, res, Q=20, strike=(0.5, 0.5),
+                            listen=(0.5, 0.5), n_modes=30, f_top=180.0, g_low=1.0,
+                            duration=0.6, fs=fs, **osc):
+    """Body IR = the three coupled low modes + the higher plate modes, mixed.
+
+    The plate's own fundamental (mode 0) is dropped -- that low resonance is now
+    handled properly by the coupled top/back/air model. `g_low` sets how loud the
+    coupled low body sits under the plate modes. `**osc` forwards soundhole
+    parameters (f_back, Volume, hole_radius, ...) to three_oscillator_model."""
+    res = int(res)
+
+    def idx(i, j):
+        return i * res + j
+
+    def frac_to_node(pt):
+        i = min(max(int(round(pt[0] * (res - 1))), 0), res - 1)
+        j = min(max(int(round(pt[1] * (res - 1))), 0), res - 1)
+        return idx(i, j)
+
+    s_node, l_node = frac_to_node(strike), frac_to_node(listen)
+    t = np.arange(int(fs * duration)) / fs
+
+    # higher plate modes (skip mode 0 = fundamental, now from the coupled model)
+    plate_f = f_top * np.sqrt(evals) / np.sqrt(evals[0])
+    freqs_p, amps_p, Qs_p = [], [], []
+    for k in range(1, min(n_modes, len(evals))):
+        freqs_p.append(plate_f[k])
+        amps_p.append(evecs[s_node, k] * evecs[l_node, k])
+        Qs_p.append(Q)
+
+    # three coupled low modes (top + back + air)
+    freqs3, ev3 = three_oscillator_model(f_top=f_top, **osc)
+    amps3 = [ev3[0, k] * (ev3[0, k] + ev3[2, k]) for k in range(3)]   # string drives top
+    Qs3 = [30, 30, 15]
+
+    freqs = np.concatenate([freqs3, freqs_p])
+    amps = np.concatenate([g_low * np.array(amps3), amps_p])
+    Qs = np.concatenate([Qs3, Qs_p])
+
+    y = modal_bank(freqs, amps, Qs, t)
+    peak = np.max(np.abs(y))
+    return (y / peak) if peak else y
+
+
+# ----------------------------------------------------------------------------
 # 3. THE INSTRUMENT  (string driven through the body)
 # ----------------------------------------------------------------------------
 # String and body are both linear and time-invariant, so passing the string
@@ -160,17 +260,26 @@ def plate_ir(evals, evecs, res, f0=220.0, Q=20.0,
 # a pre-computed body_IR and just plucks a new string through it. This mirrors
 # your notebook's guitar_voice / play_sequence design.
 
-def build_body_ir(ax, ay, resolution, f0, Q, strike, listen, n_modes, fs=fs):
+def build_body_ir(ax, ay, resolution, f0, Q, strike, listen, n_modes,
+                  model="Plate only", f_back=200.0, volume=0.012,
+                  hole_radius=0.041, g_low=1.0, fs=fs):
+    """Dispatch to the chosen body model. `f0` doubles as the top-plate
+    resonance f_top in the soundhole model (both scale the plate mode set)."""
     evals, evecs, res = orthotropic_plate(ax, ay, resolution)   # cached
+    if model == "Plate + soundhole":
+        return build_body_ir_soundhole(
+            evals, evecs, res, Q=Q, strike=strike, listen=listen,
+            n_modes=n_modes, f_top=f0, g_low=g_low,
+            f_back=f_back, Volume=volume, hole_radius=hole_radius, fs=fs)
     return plate_ir(evals, evecs, res, f0=f0, Q=Q,
                     strike=strike, listen=listen, n_modes=n_modes, fs=fs)
 
 
 def guitar_voice(f, body_IR, rho=0.99, beta=0.5, fs=fs):
     """One note: pluck a string at pitch f and convolve it through the body."""
-    N = note_to_N(f, fs)                       # invert the KS pitch law for line length
+    N = note_to_N(f, fs)                        # only used to size the render length
     dur = sustain_duration(rho=rho, N=N, fs=fs)
-    s = pluck_string(beta=beta, N=N, duration=dur, rho=rho, fs=fs)
+    s = pluck_string(beta=beta, f=f, duration=dur, rho=rho, fs=fs)  # exact tuning
     note = scipy.signal.fftconvolve(s, body_IR)
     M = min(2000, len(note))
     note[-M:] *= np.linspace(1, 0, M)          # fade the tail so it doesn't click
@@ -201,7 +310,9 @@ def make_scale(root_hz, semitones):
 
 
 def export_pack(lo, hi, beta, rho, ax, ay, resolution, f0, Q,
-                sx, sy, lx, ly, n_modes, fs=fs):
+                sx, sy, lx, ly, n_modes,
+                model="Plate only", f_back=200.0, volume=0.012,
+                hole_radius=0.041, g_low=1.0, fs=fs):
     """Render every chromatic note between lo and hi with the CURRENT settings,
     write each to its own WAV, and zip them into a sample pack.
 
@@ -210,7 +321,9 @@ def export_pack(lo, hi, beta, rho, ax, ay, resolution, f0, Q,
     is peak-normalised to 0.98 so it's a clean one-shot sample.
     """
     body_IR = build_body_ir(ax, ay, int(resolution), f0, Q,
-                            (sx, sy), (lx, ly), int(n_modes))
+                            (sx, sy), (lx, ly), int(n_modes),
+                            model=model, f_back=f_back, volume=volume,
+                            hole_radius=hole_radius, g_low=g_low)
     voice = lambda f: guitar_voice(f, body_IR, rho=rho, beta=beta, fs=fs)
 
     i0, i1 = ALL_NOTES.index(lo), ALL_NOTES.index(hi)
@@ -296,12 +409,15 @@ def build_ui():
     import gradio as gr
 
     def render(note, beta, rho, ax, ay, resolution, f0, Q,
-               sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type, mode):
+               sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type,
+               body_model, f_back, volume, hole_radius, g_low, mode):
         strike = (sx, sy)
         listen = (lx, ly)
         # Build the body IR once, then reuse it for every note via a voice closure.
         body_IR = build_body_ir(ax, ay, int(resolution), f0, Q,
-                                 strike, listen, int(n_modes))
+                                 strike, listen, int(n_modes),
+                                 model=body_model, f_back=f_back, volume=volume,
+                                 hole_radius=hole_radius, g_low=g_low)
         voice = lambda f: guitar_voice(f, body_IR, rho=rho, beta=beta)
         root = note_name_to_hz(note)
 
@@ -343,9 +459,21 @@ def build_ui():
                 ay = gr.Slider(0.5, 8.0, 1.0, step=0.1, label="Stiffness across grain a_y")
                 resolution = gr.Slider(16, 40, 30, step=2,
                                        label="Grid resolution (higher = more modes, slower)")
-                f0 = gr.Slider(80, 400, 220, step=5, label="Body base frequency f₀ (Hz)")
+                f0 = gr.Slider(80, 400, 220, step=5,
+                               label="Body base freq f₀ / top-plate f_top (Hz)")
                 Q = gr.Slider(3, 80, 20, step=1, label="Body Q (resonance sharpness / ring)")
-                f0 = gr.Slider(0, 2200, 220, step = 1, label = "Fundamental Frequency (Hz)")
+
+                gr.Markdown("### Body model")
+                body_model = gr.Radio(["Plate only", "Plate + soundhole"],
+                                      value="Plate only", label="Body model")
+                f_back = gr.Slider(120, 320, 200, step=5,
+                                   label="Back-plate resonance f_back (Hz) — soundhole")
+                volume = gr.Slider(0.004, 0.025, 0.012, step=0.001,
+                                   label="Cavity volume V (m³) — lower = higher air pitch")
+                hole_radius = gr.Slider(0.02, 0.06, 0.041, step=0.001,
+                                        label="Soundhole radius (m) — sets Helmholtz air pitch")
+                g_low = gr.Slider(0.0, 2.0, 1.0, step=0.05,
+                                  label="Low-body gain g_low — weight of coupled low modes")
             with gr.Column():
                 gr.Markdown("### Strike & listen points (fractions of the plate)")
                 sx = gr.Slider(0, 1, 0.5, step=0.02, label="Strike x")
@@ -372,13 +500,15 @@ def build_ui():
                 pack_file = gr.File(label="Sample pack — one WAV per note, current settings")
 
         inputs = [note, beta, rho, ax, ay, resolution, f0, Q,
-                  sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type, mode]
+                  sx, sy, lx, ly, n_modes, scale_steps, dt, chord_type,
+                  body_model, f_back, volume, hole_radius, g_low, mode]
         go.click(render, inputs=inputs, outputs=[audio, plot])
 
         export_btn.click(
             export_pack,
             inputs=[lo_note, hi_note, beta, rho, ax, ay, resolution, f0, Q,
-                    sx, sy, lx, ly, n_modes],
+                    sx, sy, lx, ly, n_modes,
+                    body_model, f_back, volume, hole_radius, g_low],
             outputs=pack_file,
         )
     return demo
