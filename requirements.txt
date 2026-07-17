@@ -1,0 +1,14 @@
+# RealSound runtime dependencies
+# Python 3.10+ (developed on 3.10). Everything else the code uses
+# (functools, os, re, tempfile, zipfile) is in the standard library.
+
+numpy>=1.23        # arrays, FFTs, the whole numeric core
+scipy>=1.9         # scipy.linalg (plate eigensolves), scipy.signal (filters), scipy.io.wavfile
+matplotlib>=3.6    # plots + headless figure rendering in the UI (Agg backend)
+
+# Notebook only (not needed to import realsound.py):
+#   jupyter    # to open notebooks/guitar.ipynb
+#   ipython    # IPython.display.Audio for inline playback
+
+# Demo app only (app/instrument_ui.py):
+#   gradio     # the interactive browser UI (imported lazily at call time)
