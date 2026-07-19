@@ -110,26 +110,6 @@ python app/instrument_ui.py
 ```
 
 ---
-
-## Repository layout
-
-```
-RealSound/
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── realsound.py          # validated backend module (string, plate, cavity, modal, sequencer, analysis)
-├── assets/               # curated demo image + audio used by this README
-├── notebooks/            # guitar.ipynb — the lab where new physics is prototyped
-├── docs/                 # PROJECT_GUIDE.md (charter), RealSound_Guitar_Report.md (write-up), + notes
-├── tests/                # tuning_test.py — pitch-accuracy verification harness
-└── app/                  # instrument_ui.py — the Gradio demo app
-```
-
-`realsound.py` stays at the root for now (a clean `from realsound import ...`);
-it may later become a proper `realsound/` package. Generated `.wav`/`.png` renders
-are git-ignored except the curated few in `assets/`.
-
 ## Status & honesty note
 
 This is an active research project. The models carry approximations and they are
