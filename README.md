@@ -2,7 +2,7 @@
 
 **A physics-first musical-instrument synthesizer, built from first principles in Python.**
 
-RealSound makes sound by *simulating the mechanics that produce it* — a vibrating
+RealSound makes sound by simulating the mechanics that produce it — a vibrating
 string, a stiff wooden plate, the air trapped in a body cavity — rather than by
 sampling a real instrument or stacking sine waves. The bet behind the project: if
 the physics is right, the *timbre* is right, including behaviours nobody explicitly
