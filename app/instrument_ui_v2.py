@@ -1,4 +1,3 @@
-
 import io, json, sys, tempfile, uuid, zipfile
 from functools import lru_cache
 from pathlib import Path
@@ -14,7 +13,7 @@ from nicegui import ui
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import realsound as rs
 
-#  1. SETTINGS 
+# ============================================================ 1. SETTINGS ====
 FS = 44100
 INK, MUTED = 'text-ink', 'text-ink opacity-60'
 CARD = 'w-[30rem] bg-panel gap-2'          # left column (controls)
@@ -39,9 +38,9 @@ ui.dark_mode(value=True)
 OUT = Path(tempfile.mkdtemp(prefix='realsound_'))
 
 
-#  2. ENGINE GLUE
+# ========================================================= 2. ENGINE GLUE ====
 def current_mask(shape, res, rTop, rBot, cyTop, cyBot, rHole):
-    #The body outline only -- cheap, no eigenproblem. Used by the preview.
+    """The body outline only -- cheap, no eigenproblem. Used by the preview."""
     if shape == 'Square':
         return np.ones((res, res), dtype=bool)
     return rs.boolean_8_grid(res=res, rTop=rTop, rBot=rBot,
@@ -50,7 +49,7 @@ def current_mask(shape, res, rTop, rBot, cyTop, cyBot, rHole):
 
 @lru_cache(maxsize=16)
 def solve_body(shape, res, ax, ay, rTop, rBot, cyTop, cyBot, rHole):
-    #Body geometry -> modes. THE slow step, cached on exactly what it uses.
+    """Body geometry -> modes. THE slow step, cached on exactly what it uses."""
     if shape == 'Square':
         _K, evals, evecs = rs.orthotropic_plate(ax=ax, ay=ay, resolution=res)
         return evals, evecs, np.arange(res * res).reshape(res, res)
@@ -74,7 +73,8 @@ def snap_inside(mask, fx, fy):
 
 def assemble_ir(evals, evecs, idx, t, n_modes, Q, r_s, r_l, f_top, g_low,
                 radiated, **osc):
-    """
+    """Same assembly as rs.build_body_IR, with one line switchable.
+
     POINT listen   : amp_k = phi_k(strike) * phi_k(listen)   -- a microphone at
                      one spot; a point on a node line hears nothing.
     RADIATED listen: amp_k = phi_k(strike) * mean_j phi_k(j) -- the net volume
@@ -126,7 +126,7 @@ def body_ir(shape, res, ax, ay, rTop, rBot, cyTop, cyBot, rHole,
 
 
 def make_voice(ir, beta, rho, duration):
-    #f -> audio. This closure is the 'instrument' that play_sequence plays.
+    """f -> audio, ONE-WAY: string excites body, body cannot push back."""
     def voice(f):
         s = rs.pluck_string(f=f, beta=beta, duration=duration, fs=FS, rho=rho)
         n = scipy.signal.fftconvolve(s, ir)
@@ -135,11 +135,131 @@ def make_voice(ir, beta, rho, duration):
     return voice
 
 
+
+class BodyAdmittance:
+    """Body as a mechanical ADMITTANCE (velocity out per force in), per sample.
+
+    Each mode is a 2-pole/2-zero bandpass (zeros at DC and Nyquist), which is
+    real and positive at its peak -> a passive load, not an energy source.
+    Splitting the response into an INSTANTANEOUS part (g0*F) and a STATE part
+    (past samples only) is what makes the delay-free loop at the junction
+    solvable.
+    """
+
+    def __init__(self, freqs, amps, Qs, k=0.03, fs=FS):
+        f = np.asarray(freqs, float); Q = np.asarray(Qs, float)
+        a = np.abs(np.asarray(amps, float))
+        self.r = np.exp(-np.pi * f / (Q * fs))          # pole radius <- decay
+        self.c = 2 * self.r * np.cos(2 * np.pi * f / fs)  # pole angle <- frequency
+        self.r2 = self.r ** 2
+        # k = Zs*Y at resonance. k=1 is a PERFECTLY MATCHED load (kills the
+        # string instantly); a real body is heavily mismatched and mostly
+        # reflects, so the physical range is k ~ 0.002-0.05.
+        self.G = k * (1 - self.r) * a / (a.max() + 1e-12)
+        self.g0 = self.G.sum()                           # instantaneous gain
+        self.reset()
+
+    def reset(self):
+        self.y1 = np.zeros_like(self.r); self.y2 = np.zeros_like(self.r)
+        self.x1 = 0.0; self.x2 = 0.0
+
+    def state(self):
+        """Velocity owed by the PAST only -- no dependence on this sample."""
+        return float((self.c * self.y1 - self.r2 * self.y2).sum() - self.g0 * self.x2)
+
+    def advance(self, F):
+        """Commit the resolved bridge force; returns bridge velocity."""
+        y = self.G * (F - self.x2) + self.c * self.y1 - self.r2 * self.y2
+        self.y2, self.y1 = self.y1, y
+        self.x2 = self.x1; self.x1 = F
+        return float(y.sum())
+
+
+def coupled_string(f, body, beta=0.5, duration=3.0, fs=FS, rho=0.9999):
+    """String terminated on a MOVING bridge. A proper scattering junction:
+
+        F = a + b          force  = incident + reflected
+        v = (a - b) / Zs   velocity from the wave difference
+        v = Y * F          the body's own law
+
+    solved simultaneously every sample (Zs = 1). That simultaneity is what lets
+    the body both ABSORB and RE-EMIT -- and the re-emission is what makes a wolf
+    note beat. Output is bridge velocity, so k=0 is silent BY DESIGN: no body
+    motion, no sound.
+    """
+    D = fs / f - 0.5
+    N = int(D); frac = D - N
+    p = min(max(int(beta * N), 1), N - 1)
+    buf = np.zeros(N + 2)
+    buf[:N] = np.concatenate((np.linspace(0, 1, p), np.linspace(1, 0, N - p)))
+    L = len(buf); out = np.zeros(int(fs * duration)); w = 0; last = 0.0
+    g0 = body.g0; den = 1.0 + g0
+    for i in range(len(out)):
+        y = (1 - frac) * buf[(w - N) % L] + frac * buf[(w - N - 1) % L]
+        a = 0.5 * (y + last) * rho            # incident wave, after string loss
+        b = (a * (1.0 - g0) - body.state()) / den      # resolved reflection
+        v = body.advance(a + b)                         # bridge velocity
+        buf[w] = b; last = y; out[i] = v; w = (w + 1) % L
+    return out
+
+
+def wolf_body(evals, evecs, idx, wolf_f, k=0.03, wolf_Q=120, wolf_amp=1.0,
+              n_modes=30, Q=20, f_top=180, r_s=None, r_l=None,
+              radiated=False, fs=FS):
+    """Plate modes as a live resonator bank, plus optionally one strong,
+    lightly damped mode at wolf_f.
+
+    A wolf needs energy to come BACK OUT of the body, so that mode must be
+    high-Q: the coupling rate has to beat the damping rate (~w/2Q). At Q~20 the
+    energy just leaks away and you get a dead note instead of a warble.
+
+    Deviation from the notebook: strike/listen rows are passed in (the notebook
+    hard-coded the 1/3 and 2/3 interior points), so the panel's sliders and the
+    radiated-listen toggle stay meaningful here too.
+    """
+    inside = np.argwhere(idx >= 0)
+    if r_s is None:
+        r_s = idx[tuple(inside[len(inside) // 3])]
+        r_l = idx[tuple(inside[2 * len(inside) // 3])]
+    listen_vec = evecs.mean(axis=0) if radiated else evecs[r_l]
+    pf = f_top * np.sqrt(evals) / np.sqrt(evals[0])
+    freqs = [pf[m] for m in range(1, n_modes)]
+    amps = [evecs[r_s, m] * listen_vec[m] for m in range(1, n_modes)]
+    Qs = [Q] * len(freqs)
+    if wolf_f is not None:
+        freqs.append(wolf_f); amps.append(wolf_amp); Qs.append(wolf_Q)
+    return BodyAdmittance(freqs, amps, Qs, k=k, fs=fs)
+
+
+def make_voice_twoway(modes, beta, rho, duration, k, use_wolf, wolf_det,
+                      wolf_Q, wolf_amp, n_modes, Q, f_top, r_s, r_l, radiated):
+    """f -> audio, TWO-WAY. A fresh body per note: the resonators are stateful,
+    and the wolf mode is placed relative to the note being played."""
+    evals, evecs, idx = modes
+
+    def voice(f):
+        body = wolf_body(evals, evecs, idx,
+                         wolf_f=f * (1 + wolf_det) if use_wolf else None,
+                         k=k, wolf_Q=wolf_Q, wolf_amp=wolf_amp,
+                         n_modes=n_modes, Q=Q, f_top=f_top,
+                         r_s=r_s, r_l=r_l, radiated=radiated)
+        y = coupled_string(f, body, beta=beta, duration=duration, rho=rho)
+        y[-2000:] *= np.linspace(1, 0, 2000)
+        return y
+    return voice
+
+
 def norm16(y):
-    return np.int16(0.98 * y / np.max(np.abs(y)) * 32767)
+    """Peak-normalise to 16-bit. Guarded: a fully silent buffer is legal here
+    (two-way with k=0 radiates nothing), and dividing by its zero peak would
+    produce NaN."""
+    peak = np.max(np.abs(y))
+    if not np.isfinite(peak) or peak < 1e-12:
+        return np.zeros(len(y), dtype=np.int16)
+    return np.int16(0.98 * y / peak * 32767)
 
 
-#3. VIEWS 
+# ============================================================== 3. VIEWS =====
 def style_axes(*axes):
     for a in axes:
         a.set_facecolor(BG)
@@ -177,7 +297,7 @@ def draw_mask():
 
 
 def draw_signal(y):
-    #Waveform (first 30 ms) and spectrum in dB -- verify by eye.
+    """Waveform (first 30 ms) and spectrum in dB -- verify by eye."""
     plot_box.clear()
     with plot_box:
         with ui.pyplot(figsize=(3.4, 3.2), close=True):
@@ -196,7 +316,7 @@ def draw_signal(y):
             plt.tight_layout()
 
 
-# 4. CONTROLS 
+# =========================================================== 4. CONTROLS =====
 CONTROLS = {}          # name -> element. Anything in here is saved/loaded.
 
 
@@ -227,7 +347,7 @@ def flag(key, label, value=False):
 
 with ui.row().classes('w-full justify-center items-start gap-4 p-2'):
 
-    with ui.card().classes(CARD):                       #left
+    with ui.card().classes(CARD):                       # ---------- left ----
         ui.label('RealSound').classes(f'{INK} text-lg')
 
         with ui.row().classes('w-full items-center no-wrap'):
@@ -236,7 +356,7 @@ with ui.row().classes('w-full justify-center items-start gap-4 p-2'):
 
         with ui.expansion('String', value=True).classes(SEC):
             beta = knob('beta', 'Pluck position', 0.02, 0.50, 0.13, 0.01)
-            rho = knob('rho', 'Sustain', 0.90, 0.999, 0.99, 0.001, '{:.3f}')
+            rho = knob('rho', 'Sustain', 0.90, 0.9999, 0.99, 0.0001, '{:.4f}')
             dur = knob('duration', 'Note length (s)', 0.5, 4.0, 2.0, 0.1, '{:.1f}')
 
         with ui.expansion('Body shape').classes(SEC):
@@ -267,7 +387,28 @@ with ui.row().classes('w-full justify-center items-start gap-4 p-2'):
             for k in (lxf, lyf):                      # no single point when radiating
                 k.bind_visibility_from(radiate, 'value', lambda v: not v)
 
+        with ui.expansion('Coupling').classes(SEC):
+            coupling = pick('coupling', ['One-way (IR)', 'Two-way (moving bridge)'],
+                            'One-way (IR)', 'String to body')
+            ui.label('Two-way lets the body push back on the string: wolf notes, '
+                     'dead spots, mode repulsion. Costs ~0.8 s per 3 s note.') \
+              .classes(f'{MUTED} text-xs')
+            # k = Zs*Y at resonance. Physical range ~0.002-0.05; k=1 would be a
+            # perfectly matched load. Starts at 0.002 because the output is
+            # bridge velocity, so k=0 is exactly silent.
+            kc = knob('k', 'Bridge coupling k', 0.002, 0.20, 0.03, 0.002, '{:.3f}')
+            wolf_on = flag('wolf', 'Add a wolf mode', True)
+            wolf_det = knob('wolf_detune', 'Wolf detune (%)', -20.0, 20.0, 0.0, 0.5, '{:+.1f}')
+            wolf_Q = knob('wolf_Q', 'Wolf mode Q', 20, 600, 120, 10, '{:.0f}')
+            wolf_amp = knob('wolf_amp', 'Wolf mode strength', 0.1, 3.0, 1.0, 0.1, '{:.1f}')
+            for w in (kc, wolf_on, wolf_det, wolf_Q, wolf_amp):
+                w.bind_visibility_from(coupling, 'value', lambda v: v.startswith('Two'))
+            for w in (wolf_det, wolf_Q, wolf_amp):
+                w.bind_visibility_from(wolf_on, 'value')
+
         with ui.expansion('Air cavity').classes(SEC):
+            ui.label('One-way only: the two-way path uses the live plate bank.') \
+              .classes(f'{MUTED} text-xs')
             f_back = knob('f_back', 'Back resonance (Hz)', 120, 320, 200, 5, '{:.0f}')
             volume = knob('volume', 'Cavity volume (m³)', 0.004, 0.025, 0.012, 0.001, '{:.3f}')
             hole_r = knob('hole_radius', 'Soundhole radius (m)', 0.02, 0.06, 0.041, 0.001, '{:.3f}')
@@ -280,7 +421,7 @@ with ui.row().classes('w-full justify-center items-start gap-4 p-2'):
         for w in (patt_sel, dt):
             w.bind_visibility_from(mode_sel, 'value', lambda v: v != 'Note')
 
-    with ui.card().classes(VIEW):                        #  right 
+    with ui.card().classes(VIEW):                        # ---------- right ---
         ui.label('Body').classes(f'{INK} text-lg')
         mask_box = ui.column().classes('w-full items-center')
 
@@ -312,14 +453,14 @@ with ui.row().classes('w-full justify-center items-start gap-4 p-2'):
               .props('outline color=primary').classes('w-full')
 
 
-# 5. PRESETS 
+# ============================================================ 5. PRESETS =====
 def collect():
-    #Every control's value -> a plain dict. This IS the instrument.
+    """Every control's value -> a plain dict. This IS the instrument."""
     return {k: el.value for k, el in CONTROLS.items()}
 
 
 def apply(data):
-    #Set every control from a dict; unknown keys ignored, missing keys kept.
+    """Set every control from a dict; unknown keys ignored, missing keys kept."""
     for k, v in data.items():
         if k in CONTROLS:
             CONTROLS[k].value = v
@@ -347,7 +488,7 @@ async def load_preset(e):
         ui.notify(f'Could not read that file: {err}', color='negative')
 
 
-# 6. ACTION 
+# ============================================================= 6. ACTION =====
 def current_ir():
     return body_ir(shape_sel.value, int(res.value), ax.value, ay.value,
                    rTop.value, rBot.value, cyTop.value, cyBot.value, rHole.value,
@@ -357,9 +498,27 @@ def current_ir():
                    m_top.value, m_back.value, radiate.value)
 
 
+def current_voice():
+    """The instrument: f -> audio. One-way convolves a precomputed IR; two-way
+    runs a live resonator bank the string can push against."""
+    if coupling.value.startswith('Two'):
+        modes = solve_body(shape_sel.value, int(res.value), ax.value, ay.value,
+                           rTop.value, rBot.value, cyTop.value, cyBot.value,
+                           rHole.value)
+        idx = modes[2]
+        sx, sy = snap_inside(idx >= 0, sxf.value, syf.value)
+        lx, ly = snap_inside(idx >= 0, lxf.value, lyf.value)
+        return make_voice_twoway(
+            modes, beta.value, rho.value, dur.value, kc.value,
+            wolf_on.value, wolf_det.value / 100.0, wolf_Q.value, wolf_amp.value,
+            int(n_modes.value), Q.value, f_top.value,
+            idx[sx, sy], idx[lx, ly], radiate.value)
+    return make_voice(current_ir(), beta.value, rho.value, dur.value)
+
+
 def render_current():
-    #Whatever Play would produce, as float audio.
-    voice = make_voice(current_ir(), beta.value, rho.value, dur.value)
+    """Whatever Play would produce, as float audio."""
+    voice = current_voice()
     root = NOTES[note_sel.value]
     if mode_sel.value == 'Note':
         return voice(root)
@@ -399,8 +558,10 @@ def export_pack():
     if i0 > i1:
         i0, i1 = i1, i0
     chosen = names[i0:i1 + 1]
-    ui.notify(f'Rendering {len(chosen)} notes…')
-    voice = make_voice(current_ir(), beta.value, rho.value, dur.value)
+    slow = coupling.value.startswith('Two')
+    ui.notify(f'Rendering {len(chosen)} notes…'
+              + (' (two-way: ~1 s each)' if slow else ''))
+    voice = current_voice()
     base = slug(name_in.value)
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, 'w', zipfile.ZIP_DEFLATED) as z:
