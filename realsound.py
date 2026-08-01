@@ -1,15 +1,3 @@
-"""
-realsound.py -- validated physics for the RealSound synth (backend module).
-
-Import into the notebook to use/test:  `from realsound import *`
-
-Only STABLE, verified functions live here. New/experimental physics stays in the
-notebook as functions until it settles, then graduates into this file.
-
-Design rule: every function is pure, with all inputs as explicit parameters (no
-notebook globals like fs/t/f_0/idx). Clean imports, and a near-mechanical port to
-C++/Rust later.
-"""
 
 import numpy as np
 import scipy.linalg
@@ -98,6 +86,25 @@ def plate_from_mask(mask, ax=4, ay=1):
     return evals, evecs, idx
 
 
+def snap_inside(mask, fx, fy):
+    """Fractional (0-1) body coordinate -> a grid cell that is really inside.
+
+    Guards a silent failure: build_body_IR does idx[sx, sy], and an exterior
+    cell holds -1, which numpy reads as the LAST matrix row. That produces
+    plausible-sounding but wrong audio with no error. Snapping to the nearest
+    interior cell makes any requested point land on the body -- including
+    points inside the soundhole, which is a real hole in the mesh.
+    """
+    res = mask.shape[0]
+    i = min(max(int(round(fx * (res - 1))), 0), res - 1)
+    j = min(max(int(round(fy * (res - 1))), 0), res - 1)
+    if mask[i, j]:
+        return i, j
+    ii, jj = np.where(mask)
+    k = int(np.argmin((ii - i) ** 2 + (jj - j) ** 2))
+    return int(ii[k]), int(jj[k])
+
+
 def three_oscillator_model(f_top=180, f_back=200, m_top=0.15, m_back=0.05,
                            Volume=0.012, hole_radius=0.041, hole_thickness=0.003,
                            top_area=0.18, back_area=0.013, rho=1.2, c=343):
@@ -131,7 +138,7 @@ def modal_bank(freqs, amps, Qs, t):
 
 def build_body_IR(evals, evecs, idx, t, n_modes=30, Q=20,
                   sx=None, sy=None, lx=None, ly=None,
-                  f_top=180, g_low=0.1, **osc):
+                  f_top=180, g_low=0.1, radiated=False, **osc):
     """Full acoustic-body impulse response: the higher distributed plate modes
     plus the three coupled low modes (top/back/air) from three_oscillator_model.
 
@@ -139,6 +146,17 @@ def build_body_IR(evals, evecs, idx, t, n_modes=30, Q=20,
           For a plain square body, pass plate_from_mask(np.ones((res,res), bool)).
     sx,sy / lx,ly : strike / listen grid cells; default to interior points.
     g_low : balances low-end boom (coupled modes) vs plate coloration.
+    radiated : how the plate modes are heard.
+        False -> amp = phi(strike) * phi(listen): a microphone at one point;
+                 a listen point on a mode's node line hears nothing of it.
+        True  -> amp = phi(strike) * mean_j phi(j): the net volume of air the
+                 mode displaces. The compact-source (monopole) approximation,
+                 honest while the body is small compared to the wavelength.
+                 Antisymmetric modes have +/- halves that cancel, so their mean
+                 is ~0 and they go silent on their own -- dipole cancellation
+                 emerging from the mode shapes rather than being imposed.
+        The three coupled low modes already carry their own radiation term
+        (drive = top, radiate = top + air) and are unaffected either way.
     **osc : forwarded to three_oscillator_model (Volume, hole_radius, ...).
     """
     inside = np.argwhere(idx >= 0)                  # cells inside the body
@@ -149,10 +167,11 @@ def build_body_IR(evals, evecs, idx, t, n_modes=30, Q=20,
 
     # higher plate modes (skip mode 0 -- fundamental is handled by the coupling)
     plate_f = f_top * np.sqrt(evals) / np.sqrt(evals[0])
+    listen_vec = evecs.mean(axis=0) if radiated else evecs[r_l]
     freqs_p, amps_p, Qs_p = [], [], []
     for k in range(1, n_modes):
         freqs_p.append(plate_f[k])
-        amps_p.append(evecs[r_s, k] * evecs[r_l, k])
+        amps_p.append(evecs[r_s, k] * listen_vec[k])
         Qs_p.append(Q)
 
     # three coupled low modes: drive = top component, radiate = top + air
@@ -165,6 +184,125 @@ def build_body_IR(evals, evecs, idx, t, n_modes=30, Q=20,
     Qs    = np.concatenate([Qs3, Qs_p])
     y = modal_bank(freqs, amps, Qs, t)
     return y / np.max(np.abs(y))
+
+
+# ================================================= TWO-WAY COUPLING ==========
+# One-way (build_body_IR + convolution) treats the body as a finished recording
+# of how it rings: it cannot react. Two-way needs the body to respond WHILE the
+# string is running, so each mode becomes a live 2-pole resonator evaluated per
+# sample -- pole angle sets frequency, pole radius sets decay. Out of this fall
+# wolf notes, dead spots and mode repulsion, none of them programmed.
+
+class BodyAdmittance:
+    """Body as a mechanical ADMITTANCE (velocity out per force in), per sample.
+
+    Each mode is a 2-pole/2-zero bandpass (zeros at DC and Nyquist), which is
+    real and positive at its peak -> a passive load, not an energy source.
+    Splitting the response into an INSTANTANEOUS part (g0*F) and a STATE part
+    (past samples only) is what makes the delay-free loop at the junction
+    solvable.
+
+    Stateful: one instance per note. Call reset() to reuse.
+    """
+
+    def __init__(self, freqs, amps, Qs, k=0.03, fs=44100):
+        f = np.asarray(freqs, float)
+        Q = np.asarray(Qs, float)
+        a = np.abs(np.asarray(amps, float))
+        self.r = np.exp(-np.pi * f / (Q * fs))            # pole radius <- decay
+        self.c = 2 * self.r * np.cos(2 * np.pi * f / fs)  # pole angle <- frequency
+        self.r2 = self.r ** 2
+        # k = Zs*Y at resonance. k=1 is a PERFECTLY MATCHED load (kills the
+        # string instantly). A real body is heavily mismatched and mostly
+        # reflects, so the physical range is k ~ 0.002-0.05.
+        self.G = k * (1 - self.r) * a / (a.max() + 1e-12)
+        self.g0 = self.G.sum()                            # instantaneous gain
+        self.reset()
+
+    def reset(self):
+        self.y1 = np.zeros_like(self.r)
+        self.y2 = np.zeros_like(self.r)
+        self.x1 = 0.0
+        self.x2 = 0.0
+
+    def state(self):
+        """Velocity owed by the PAST only -- independent of this sample."""
+        return float((self.c * self.y1 - self.r2 * self.y2).sum() - self.g0 * self.x2)
+
+    def advance(self, F):
+        """Commit the resolved bridge force; returns bridge velocity."""
+        y = self.G * (F - self.x2) + self.c * self.y1 - self.r2 * self.y2
+        self.y2, self.y1 = self.y1, y
+        self.x2 = self.x1
+        self.x1 = F
+        return float(y.sum())
+
+
+def coupled_string(f, body, beta=0.5, duration=3.0, fs=44100, rho=0.9999):
+    """String terminated on a MOVING bridge. A proper scattering junction:
+
+        F = a + b          force  = incident + reflected
+        v = (a - b) / Zs   velocity from the wave difference
+        v = Y * F          the body's own law
+
+    solved simultaneously every sample (Zs = 1). That simultaneity is what lets
+    the body both ABSORB and RE-EMIT; the re-emission is what makes a wolf note
+    beat. Output is bridge velocity, so k=0 is silent BY DESIGN -- no body
+    motion, no sound. Normalise with a zero-peak guard.
+    """
+    D = fs / f - 0.5                                  # fractional-delay tuning
+    N = int(D)
+    frac = D - N
+    p = min(max(int(beta * N), 1), N - 1)
+    buf = np.zeros(N + 2)
+    buf[:N] = np.concatenate((np.linspace(0, 1, p), np.linspace(1, 0, N - p)))
+    L = len(buf)
+    out = np.zeros(int(fs * duration))
+    w = 0
+    last = 0.0
+    g0 = body.g0
+    den = 1.0 + g0
+    for i in range(len(out)):
+        y = (1 - frac) * buf[(w - N) % L] + frac * buf[(w - N - 1) % L]
+        a = 0.5 * (y + last) * rho                    # incident, after string loss
+        b = (a * (1.0 - g0) - body.state()) / den     # resolved reflection
+        v = body.advance(a + b)                       # bridge velocity
+        buf[w] = b
+        last = y
+        out[i] = v
+        w = (w + 1) % L
+    return out
+
+
+def wolf_body(evals, evecs, idx, wolf_f=None, k=0.03, wolf_Q=120, wolf_amp=1.0,
+              n_modes=30, Q=20, f_top=180, sx=None, sy=None, lx=None, ly=None,
+              radiated=False, fs=44100):
+    """Plate modes as a live BodyAdmittance, plus optionally one strong,
+    lightly damped mode at wolf_f.
+
+    A wolf needs energy to come BACK OUT of the body, so that mode must be
+    high-Q: the coupling rate has to beat the damping rate (~w/2Q). At Q~20 the
+    energy leaks away and you get a dead note instead of a warble.
+
+    Strike/listen cells and `radiated` follow build_body_IR, so the same body
+    description drives either coupling path.
+    """
+    inside = np.argwhere(idx >= 0)
+    if sx is None:
+        sx, sy = inside[len(inside) // 3]
+        lx, ly = inside[2 * len(inside) // 3]
+    r_s, r_l = idx[sx, sy], idx[lx, ly]
+
+    listen_vec = evecs.mean(axis=0) if radiated else evecs[r_l]
+    plate_f = f_top * np.sqrt(evals) / np.sqrt(evals[0])
+    freqs = [plate_f[m] for m in range(1, n_modes)]
+    amps = [evecs[r_s, m] * listen_vec[m] for m in range(1, n_modes)]
+    Qs = [Q] * len(freqs)
+    if wolf_f is not None:
+        freqs.append(wolf_f)
+        amps.append(wolf_amp)
+        Qs.append(wolf_Q)
+    return BodyAdmittance(freqs, amps, Qs, k=k, fs=fs)
 
 
 # ======================================================= SEQUENCING ==========
