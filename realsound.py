@@ -305,6 +305,105 @@ def wolf_body(evals, evecs, idx, wolf_f=None, k=0.03, wolf_Q=120, wolf_amp=1.0,
     return BodyAdmittance(freqs, amps, Qs, k=k, fs=fs)
 
 
+# ======================================================= NONLINEARITY ========
+# The only block in this library that CREATES spectrum. Everything above is
+# linear -- delay lines, mode banks, biquads, convolution -- so its output is
+# its input FILTERED, and no parameter in any of it can produce a partial that
+# was not already present. Measured: a sine through comb + RLC leaves h2/h3/h5
+# at -294 to -314 dB (the float64 floor); tanh at drive 4 puts h3 at -11 dB.
+#
+# Two properties that are not optional:
+#   NO COMMUTATION. f(H(x)) != H(f(x)). Stage order becomes physical, and the
+#     commuted-synthesis shortcut used for the body IR dies. Measured RMS gap
+#     between orderings: -89 dB at drive 0.01, -12 dB at 1, -1 dB at 10.
+#   ALIASING. New harmonics ignore Nyquist and fold to fs-f, landing inharmonic
+#     and BELOW the fundamental. 3 kHz sine at drive 20: -15.1 dB inharmonic
+#     naive vs -54.3 dB at 16x, with fold-back at 17101, 11102, 5102 Hz.
+
+def oversampled(fn, x, factor=8):
+    """Run a memoryless nonlinearity at factor*fs, then band-limit and decimate.
+
+    tanh of a band-limited signal is not band-limited. Oversampling pushes the
+    fold-back point up; the decimation filter removes everything above the
+    original Nyquist BEFORE the rate drops. Order matters: limit, then decimate.
+    factor=8 suffices for smooth curves; corners (hard, fold) want 16-32 and
+    still leave residue -- a discontinuous shaper cannot be made clean.
+    """
+    up = scipy.signal.resample_poly(x, factor, 1)
+    return scipy.signal.resample_poly(fn(up), 1, factor)
+
+
+SHAPES = {
+    # soft saturation: smooth, harmonics decay fast -> "warm"
+    'tanh':  lambda u: np.tanh(u),
+    # corners = derivative discontinuities -> 1/n harmonic series, buzzy, aliases worst
+    'hard':  lambda u: np.clip(u, -1.0, 1.0),
+    # below the clamp this is exactly 1.5*(u - u^3/3). Since sin^3=(3sin-sin3)/4,
+    # a sine of amplitude a gives EXACTLY h1 = 1.5a-0.375a^3 and h3 = a^3/8 and
+    # nothing else. Verified to 0.00 dB -- the library's one testable shaper.
+    'cubic': lambda u: np.where(np.abs(u) < 1.0, 1.5 * (u - u**3 / 3.0),
+                                np.sign(u)),
+    # NON-MONOTONIC: past threshold the output goes back DOWN. Nothing in
+    # acoustics does this -- saturators run out of headroom, folders reverse.
+    # Drive is a timbre control, not a loudness one: at drive 4 its h5 comes out
+    # +4.9 dB ABOVE the fundamental, and total content peaks then FALLS with
+    # more drive as folds restructure the spectrum.
+    'fold':  lambda u: np.sin(u * np.pi / 2.0),
+}
+
+
+def nonlinear(x, kind='tanh', drive=1.0, bias=0.0, factor=8, mix=1.0,
+              normalize=True):
+    """Anti-aliased memoryless nonlinearity. The fifth primitive.
+
+    drive : gain into the curve, and the real control -- a shaper is nonlinear
+            only in proportion to how hard it is hit. Below drive 1 every shape
+            here is a wire ('hard' measures -180 dB, i.e. exactly linear).
+            Above drive 8 the three saturators converge to -7.2 dB total
+            harmonic content and become indistinguishable: they have all turned
+            into the same square wave. `kind` therefore only means anything
+            between drive 1 and 8. 'fold' does not converge.
+    bias  : DC added before the curve, removed after. THE SYMMETRY CONTROL, and
+            it changes the sound more than `kind` does. Every shape here is odd,
+            and an odd function yields only ODD harmonics -- h2 measures -195 dB,
+            exactly nothing. Offsetting onto an asymmetric part of the curve
+            brings evens in: h2 = -32.6 dB at bias 0.1, -23.1 at 0.3, -14.6 at
+            0.8. Odd-only reads hollow; evens present read warm. This is a tube's
+            grid bias, and it is why a stray DC offset upstream is never cosmetic.
+    mix   : parallel dry/wet blend; keeps attack detail heavy drive would flatten.
+
+    DC removal is a mean subtraction -- exact, and valid because this project
+    renders offline. Real-time needs a one-pole high-pass instead.
+    """
+    if kind not in SHAPES:
+        raise ValueError(f"kind must be one of {sorted(SHAPES)}, got {kind!r}")
+    f = SHAPES[kind]
+    y = oversampled(lambda u: f(drive * u + bias), x, factor)[:len(x)]
+    y = y - y.mean()                                   # undo bias, keep its effect
+    y = mix * y + (1.0 - mix) * x[:len(y)]
+    if normalize and np.abs(y).max() > 0:
+        y = y / np.abs(y).max()
+    return y
+
+
+def harmonic_report(y, f0, fs=44100, n=8):
+    """(harmonic levels in dB rel h1, total inharmonic energy in dB).
+
+    Inharmonic energy is the honest test of a nonlinearity: harmonics are the
+    point, anything that is not one is damage.
+    """
+    A = np.abs(np.fft.rfft(y * np.hanning(len(y))))
+    fr = np.fft.rfftfreq(len(y), 1 / fs)
+    idx = [np.argmin(np.abs(fr - k * f0)) for k in range(1, n + 1)]
+    ref = A[idx[0]]
+    lv = [20 * np.log10(A[max(0, i - 2):i + 3].max() / ref + 1e-18) for i in idx]
+    mask = np.ones(len(A), bool)
+    for k in range(1, int(fr[-1] / f0) + 1):
+        i = np.argmin(np.abs(fr - k * f0)); mask[max(0, i - 3):i + 4] = False
+    mask[:3] = False
+    return lv, 20 * np.log10(np.sqrt((A[mask] ** 2).sum()) / ref + 1e-18)
+
+
 # ======================================================= SEQUENCING ==========
 
 def make_scale(root_hz, semitones):
