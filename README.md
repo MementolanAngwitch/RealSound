@@ -1,4 +1,4 @@
-# RealSound
+# PhyiscalStrings
 
 **A physics-first musical-instrument synthesizer, built from first principles in Python.**
 
